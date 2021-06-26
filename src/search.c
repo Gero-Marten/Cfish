@@ -100,9 +100,6 @@ struct Skill {
 //  Move best = 0;
 };
 
-// Breadcrumbs are used to mark nodes as being search by a given thread
-static _Atomic uint64_t breadcrumbs[1024];
-
 static Value search_PV(Position *pos, Stack *ss, Value alpha, Value beta,
     Depth depth);
 static Value search_NonPV(Position *pos, Stack *ss, Value alpha, Depth depth,
@@ -974,14 +971,6 @@ INLINE Value search_node(Position *pos, Stack *ss, Value alpha, Value beta,
            && ttValue != VALUE_NONE
            && ttValue < probCutBeta))
   {
-    if (   ss->ttHit
-        && tte_depth(tte) >= depth - 3
-        && ttValue != VALUE_NONE
-        && ttValue >= probCutBeta
-        && ttMove
-        && is_capture_or_promotion(pos, ttMove))
-      return probCutBeta;
-
     mp_init_pc(pos, ttMove, probCutBeta - ss->staticEval);
     int probCutCount = 2 + 2 * cutNode;
     bool ttPv = ss->ttPv;
@@ -1055,25 +1044,13 @@ moves_loop: // When in check search starts from here
   value = bestValue;
   singularQuietLMR = moveCountPruning = false;
 
-  // Check for a breadcrumb and leave one if none found
-  _Atomic uint64_t *crumb = NULL;
-  bool marked = false;
-  if (ss->ply < 8) {
-    crumb = &breadcrumbs[posKey & 1023];
-    // The next line assumes there are at most 65535 search threads
-    uint64_t v = (posKey & ~0xffffULL) | (pos->threadIdx + 1), expected = 0ULL;
-    // If no crumb is in place yet, leave ours
-    if (!atomic_compare_exchange_strong_explicit(crumb, &expected, v,
-          memory_order_relaxed, memory_order_relaxed))
-    {
-      // Some crumb was in place already. Its value is now in expected.
-      crumb = NULL;
-      // Was the crumb is for the same position and was left by another thread?
-      v ^= expected;
-      if (v != 0 && (v & ~0xffffULL) == 0)
-        marked = true;
-    }
-  }
+  // Indicate PvNodes that will probably fail low if node was searched with
+  // non-PV search at depth equal to or greater than current depth and the
+  // result of the search was far below alpha
+  bool likelyFailLow =   PvNode
+                      && ttMove
+                      && (tte_bound(tte) & BOUND_UPPER)
+                      && tte_depth(tte) >= depth;
 
   // Step 12. Loop through moves
   // Loop through all pseudo-legal moves until no moves remain or a beta
@@ -1121,15 +1098,6 @@ moves_loop: // When in check search starts from here
 
     givesCheck = gives_check(pos, ss, move);
 
-    // Indicate PvNodes that will probably fail low if node was searched with
-    // non-PV search at depth equal to or greater than current depth and the
-    // result of the search was far below alpha
-    bool likelyFailLow =   PvNode
-                        && ttMove
-                        && (tte_bound(tte) & BOUND_UPPER)
-                        && ttValue < alpha + 200 + 100 * depth
-                        && tte_depth(tte) >= depth;
-
     // Calculate new depth for this move
     newDepth = depth - 1;
 
@@ -1160,7 +1128,7 @@ moves_loop: // When in check search starts from here
       } else {
 
         // Countermoves based pruning
-        if (   lmrDepth < 4 + ((ss-1)->statScore > 0 || (ss-1)->moveCount == 1)
+        if (   lmrDepth < 4
             && (*cmh )[movedPiece][to_sq(move)] < CounterMovePruneThreshold
             && (*fmh )[movedPiece][to_sq(move)] < CounterMovePruneThreshold)
           continue;
@@ -1209,6 +1177,8 @@ moves_loop: // When in check search starts from here
       if (value < singularBeta) {
         extension = 1;
         singularQuietLMR = !ttCapture;
+        if (!PvNode && value < singularBeta - 140)
+          extension = 2;
       }
 
       // Multi-cut pruning. Our ttMove is assumed to fail high, and now we
@@ -1216,10 +1186,8 @@ moves_loop: // When in check search starts from here
       // assume that this expected cut-node is not singular, i.e. multiple
       // moves fail high. We therefore prune the whole subtree by returning
       // a soft bound.
-      else if (singularBeta >= beta) {
-        if (crumb) store_rlx(*crumb, 0);
+      else if (singularBeta >= beta)
         return singularBeta;
-      }
 
       // If the eval of ttMove is greater than beta we also check whether
       // there is another move that pushes it over beta. If so, we prune.
@@ -1234,10 +1202,8 @@ moves_loop: // When in check search starts from here
         value = search_NonPV(pos, ss, beta - 1, (depth + 3) / 2, cutNode);
         ss->excludedMove = 0;
 
-        if (value >= beta) {
-          if (crumb) store_rlx(*crumb, 0);
+        if (value >= beta)
           return beta;
-        }
       }
 
       // The call to search_NonPV with the same value of ss messed up our
@@ -1248,16 +1214,6 @@ moves_loop: // When in check search starts from here
       ss->mpKillers[0] = k1; ss->mpKillers[1] = k2;
 
     }
-
-    // Check extension
-    else if (    givesCheck
-             && (is_discovered_check_on_king(pos, !stm(), move) || see_test(pos, move, 0)))
-      extension = 1;
-
-    // Last capture extension
-    else if (   PieceValue[EG][captured_piece()] > PawnValueEg
-             && non_pawn_material() <= 2 * RookValueMg)
-      extension = 1;
 
     // Add extension to new depth
     newDepth += extension;
@@ -1287,17 +1243,14 @@ moves_loop: // When in check search starts from here
             || ss->staticEval + PieceValue[EG][captured_piece()] <= alpha
             || cutNode
             || (!PvNode && !formerPv && (*pos->captureHistory)[movedPiece][to_sq(move)][type_of_p(captured_piece())] < 3678)
-            || pos->ttHitAverage < 432 * ttHitAverageResolution * ttHitAverageWindow / 1024))
+            || pos->ttHitAverage < 432 * ttHitAverageResolution * ttHitAverageWindow / 1024)
+        && (!PvNode || ss->ply > 1 || pos->threadIdx % 4 != 3))
     {
       Depth r = reduction(improving, depth, moveCount);
 
       // Decrease reduction if the ttHit runing average is large
       if (pos->ttHitAverage > 537 * ttHitAverageResolution * ttHitAverageWindow / 1024)
         r--;
-
-      // Increase reduction if other threads are searching this position.
-      if (marked)
-        r++;
 
       // Decrease reduction if position is or has been on the PV and the node
       // is not likely to fail low
@@ -1309,9 +1262,6 @@ moves_loop: // When in check search starts from here
       if ((rootNode || !PvNode) && pos->rootDepth > 10 && pos->bestMoveChanges <= 2)
         r++;
 
-      if (moveCountPruning && !formerPv)
-        r++;
-
       // Decrease reduction if opponent's move count is high
       if ((ss-1)->moveCount > 13)
         r--;
@@ -1320,14 +1270,7 @@ moves_loop: // When in check search starts from here
       if (singularQuietLMR)
         r--;
 
-      if (captureOrPromotion) {
-        // Unless giving check, this capture is likely bad
-        if (   !givesCheck
-            && ss->staticEval + PieceValue[EG][captured_piece()] + 210 * depth <= alpha)
-          r++;
-
-      } else {
-
+      if (!captureOrPromotion) {
         // Increase reduction if ttMove is a capture
         if (ttCapture)
           r++;
@@ -1340,31 +1283,13 @@ moves_loop: // When in check search starts from here
         if (cutNode)
           r += 2;
 
-        // Decrease reduction for moves that escape a capture. Filter out
-        // castling moves, because they are coded as "king captures rook" and
-        // hence break make_move().
-        else if (   type_of_m(move) == NORMAL
-                 && !see_test(pos, reverse_move(move), 0))
-          r -= 2 + ss->ttPv - (type_of_p(movedPiece) == PAWN);
-
         ss->statScore =  (*cmh )[movedPiece][to_sq(move)]
                        + (*fmh )[movedPiece][to_sq(move)]
                        + (*fmh2)[movedPiece][to_sq(move)]
                        + (*pos->mainHistory)[!stm()][from_to(move)]
                        - 4741;
 
-        // Decrease/increase reduction by comparing with opponent's stat score.
-        if (ss->statScore >= -89 && (ss-1)->statScore < -116)
-          r--;
-
-        else if ((ss-1)->statScore >= -112 && ss->statScore < -100)
-          r++;
-
-        // Decrease/increase reduction for moves with a good/bad history.
-        if (inCheck)
-          r -= (  (*pos->mainHistory)[!stm()][from_to(move)]
-                + (*cmh)[movedPiece][to_sq(move)] - 3833) / 16384;
-        else
+        if (!inCheck)
           r -= ss->statScore / 14790;
       }
 
@@ -1414,10 +1339,8 @@ moves_loop: // When in check search starts from here
     // Finished searching the move. If a stop occurred, the return value of
     // the search cannot be trusted, and we return immediately without
     // updating best move, PV and TT.
-    if (load_rlx(Threads.stop)) {
-      if (crumb) store_rlx(*crumb, 0);
+    if (load_rlx(Threads.stop))
       return 0;
-    }
 
     if (rootNode) {
       RootMove *rm = NULL;
@@ -1477,8 +1400,6 @@ moves_loop: // When in check search starts from here
         quietsSearched[quietCount++] = move;
     }
   }
-
-  if (crumb) store_rlx(*crumb, 0);
 
   // The following condition would detect a stop only after move loop has
   // been completed. But in this case bestValue is valid because we have
@@ -2131,9 +2052,6 @@ void start_thinking(Position *root, bool ponderMode)
   Threads.stop = false;
   Threads.increaseDepth = true;
   Threads.ponder = ponderMode;
-
-  for (int i = 0; i < 1024; i++)
-    store_rlx(breadcrumbs[i], 0);
 
   // Generate all legal moves.
   ExtMove list[MAX_MOVES];
